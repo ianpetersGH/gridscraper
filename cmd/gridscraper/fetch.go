@@ -13,6 +13,12 @@ import (
 
 var fetchVisible bool
 
+var fetchNYSEG = func(ctx context.Context, cookies []config.Cookie, token, username, password string, visible bool, days int) ([]models.UsageData, error) {
+	s := scraper.NewNYSEGDirectScraperWithCredentials(cookies, token, username, password)
+	s.SetVisible(visible)
+	return s.Scrape(ctx, days)
+}
+
 var fetchCmd = &cobra.Command{
 	Use:   "fetch [service]",
 	Short: "Fetch usage data from a service",
@@ -63,6 +69,9 @@ func runFetch(cmd *cobra.Command, args []string) error {
 		challengeAnswer = cfg.Cookies.ConEdChallengeAnswer
 	}
 
+	if service == "nyseg" && (username == "" || password == "") {
+		return fmt.Errorf("NYSEG browser CSV fetch requires configured username/password; cookies alone are not supported; use import-csv for offline history")
+	}
 	// Check if we have either cookies+token OR username+password for auto-auth
 	if len(cookies) == 0 && (username == "" || password == "") {
 		return fmt.Errorf("no authentication configured for %s. Add username/password to config.yaml or run 'gridscraper login %s'", service, service)
@@ -76,7 +85,7 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	defer db.Close()
 
 	// Create scraper based on service
-	ctx := context.Background()
+	ctx := cmd.Context()
 	var data []models.UsageData
 
 	// Get service-specific days to fetch
@@ -88,59 +97,12 @@ func runFetch(cmd *cobra.Command, args []string) error {
 	}
 
 	if service == "nyseg" {
-		// NYSEG scraper with auth token
-		nysegScraper := scraper.NewNYSEGDirectScraperWithCredentials(cookies, authToken, username, password)
-		nysegScraper.SetVisible(fetchVisible)
-
-		// If we have username/password but no cookies, do proactive login
-		if len(cookies) == 0 && username != "" && password != "" {
-			fmt.Println("No cookies found, performing initial login...")
-			freshCookies, freshToken, err := nysegScraper.RefreshAuth(ctx)
-			if err != nil {
-				return fmt.Errorf("initial login failed: %w", err)
-			}
-			cfg.Cookies.NYSEG = freshCookies
-			cfg.Cookies.NYSEGAuthToken = freshToken
-			if err := saveConfig(cfg); err != nil {
-				fmt.Printf("Warning: Could not save credentials: %v\n", err)
-			} else {
-				fmt.Println("✓ Login successful, credentials saved")
-			}
-		}
-
-		// Scrape data with automatic auth refresh on failure
-		fmt.Printf("Fetching data from %s (last %d days)...\n", service, daysToFetch)
-		var err error
-		data, err = nysegScraper.Scrape(ctx, daysToFetch)
-
-		// If scraping failed and we have credentials, try refreshing auth and retry
-		if err != nil && username != "" && password != "" {
-			fmt.Printf("⚠ Scraping failed: %v\n", err)
-			fmt.Printf("⚠ Attempting to refresh credentials and retry...\n")
-
-			freshCookies, freshToken, refreshErr := nysegScraper.RefreshAuth(ctx)
-			if refreshErr != nil {
-				return fmt.Errorf("refreshing auth: %w (original error: %v)", refreshErr, err)
-			}
-
-			cfg.Cookies.NYSEG = freshCookies
-			cfg.Cookies.NYSEGAuthToken = freshToken
-			if saveErr := saveConfig(cfg); saveErr != nil {
-				fmt.Printf("Warning: Could not save refreshed credentials: %v\n", saveErr)
-			} else {
-				fmt.Println("✓ Credentials refreshed and saved")
-			}
-
-			// Create a fresh scraper with the new credentials
-			fmt.Println("Retrying fetch with fresh credentials...")
-			nysegScraper = scraper.NewNYSEGDirectScraperWithCredentials(freshCookies, freshToken, username, password)
-			data, err = nysegScraper.Scrape(ctx, daysToFetch)
-
-			if err != nil {
-				return fmt.Errorf("scraping failed after auth refresh: %w", err)
-			}
-		} else if err != nil {
-			return fmt.Errorf("scraping: %w (hint: add username/password to config.yaml for automatic login)", err)
+		// This is browser-authenticated CSV export, not the v2 hourly API.
+		// Scrape logs in once. Never retry credential submissions or rewrite config.
+		fmt.Printf("Fetching NYSEG browser CSV (configured lookback %d days; portal range may differ)...\n", daysToFetch)
+		data, err = fetchNYSEG(ctx, cookies, authToken, username, password, fetchVisible, daysToFetch)
+		if err != nil {
+			return fmt.Errorf("NYSEG scrape failed (not retried): %w", err)
 		}
 	} else if service == "coned" {
 		// Con Edison scraper with auth token, customer UUID, and challenge answer
@@ -184,6 +146,18 @@ func runFetch(cmd *cobra.Command, args []string) error {
 
 	if len(data) == 0 {
 		fmt.Println("No data found")
+		return nil
+	}
+
+	if service == "nyseg" {
+		for i := range data {
+			data[i].Service = service
+		}
+		inserted, err := db.InsertUsageBatch(data)
+		if err != nil {
+			return fmt.Errorf("storing NYSEG batch: %w", err)
+		}
+		fmt.Printf("Validated %d records; inserted %d, unchanged %d\n", len(data), inserted, len(data)-inserted)
 		return nil
 	}
 

@@ -1,11 +1,13 @@
 # GridScraper
 
+> **Fork hardening:** NYSEG uses browser-authenticated **CSV export**, not a direct hourly API. See [NYSEG safety and CSV import](docs/nyseg.md). The inherited AppDaemon helper writes directly to Home Assistant Recorder tables; **do not deploy it** as part of this setup. Fetch/import testing does not validate that integration.
+
 A Go-based CLI tool to scrape electrical usage data from utility websites (NYSEG and Con Edison). Uses browser automation to extract hourly kWh data and stores it in a local SQLite database. Publishes historical data to Home Assistant for detailed energy tracking and analysis.
 
 ## Features
 
 - **Automatic authentication**: Configure username/password for automatic login
-- **Hourly usage data**: Fetches detailed hourly kWh readings (24 readings per day)
+- **Hourly usage data**: Fetches interval kWh readings (DST transition days may have 23 or 25 hours)
 - **Browser automation**: Uses chromedp for JavaScript-rendered pages
 - **Duplicate prevention**: Won't re-scrape existing data
 - **SQLite storage**: Local database for tracking usage over time
@@ -49,11 +51,11 @@ cookies:
   coned_challenge_answer: "Answer to your security question"
 ```
 
-The application will automatically log in and refresh authentication as needed when fetching data.
+NYSEG fetch submits one browser login per invocation and never automatically retries credentials or rewrites the config. Con Edison retains upstream behavior.
 
 **Alternative: Manual Login** (optional)
 
-If you prefer not to store credentials in the config file, you can manually capture cookies:
+You can manually capture cookies for diagnostics/legacy flows. **NYSEG fetch currently requires username/password even if cookies were saved**; use offline `import-csv` when credentials are unavailable:
 
 ```bash
 # Login to NYSEG (opens browser for manual login)
@@ -79,10 +81,10 @@ gridscraper fetch coned
 
 This will:
 - Automatically log in if needed (using credentials or existing cookies)
-- Download hourly usage data (NYSEG: API calls, Con Edison: CSV export via browser automation)
-- Store hourly readings (24 per day) in `./data.db`
-- Skip any timestamps that already exist (duplicate prevention)
-- Fetch the last 90 days by default (configurable via `days_to_fetch`, `nyseg_days_to_fetch`, or `coned_days_to_fetch` in config)
+- Download hourly usage data (NYSEG: browser-authenticated CSV export and job polling; Con Edison: CSV export via browser automation)
+- Store interval readings in `./data.db`; new NYSEG timestamps are offset-qualified UTC
+- NYSEG: skip identical existing intervals; conflicting values/end times or overlaps fail atomically
+- Con Edison: configurable lookback; NYSEG currently exports the portal-selected range (its lookback setting is not applied to the portal request)
 - For Con Edison: Downloads 15-minute intervals and aggregates to hourly data
 
 ### 3. View Stored Data
@@ -324,10 +326,10 @@ If data extraction fails, use debug mode:
 
 ```bash
 # Open visible browser to inspect page
-gridscraper debug nyseg --visible
+gridscraper fetch nyseg --visible
 
 # Save HTML to file for inspection
-gridscraper debug nyseg --output output.html
+# Raw HTML/network diagnostics are disabled for NYSEG (credential exposure).
 ```
 
 ## Configuration
@@ -435,8 +437,8 @@ go test ./...
 
 - **Status**: Implemented
 - **URL**: https://energymanager.nyseg.com/insights
-- **Data**: Hourly kWh usage (24 readings/day)
-- **Method**: Direct API calls with browser authentication
+- **Data**: Interval kWh usage; zeros preserved, invalid/ambiguous records rejected
+- **Method**: Browser login, portal CSV export, bounded job polling (not the v2 billing-summary API)
 - **Home Assistant**: Single instance support
 
 ### Con Edison (NYC)
@@ -461,14 +463,14 @@ gridscraper login nyseg
 
 1. Use debug mode to inspect the page:
    ```bash
-   gridscraper debug nyseg --visible
+   gridscraper fetch nyseg --visible
    ```
 
 2. Check if the page structure has changed
 
 3. Save HTML and inspect selectors:
    ```bash
-   gridscraper debug nyseg --output page.html
+   # Raw HTML/network diagnostics are disabled for NYSEG (credential exposure).
    ```
 
 ### Cookies expired

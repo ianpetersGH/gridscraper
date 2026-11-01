@@ -29,6 +29,9 @@ func init() {
 
 func runInspect(cmd *cobra.Command, args []string) error {
 	service := args[0]
+	if service == "nyseg" {
+		return fmt.Errorf("raw NYSEG diagnostics are disabled: HTML/network dumps may expose credentials; use fetch --visible or offline import-csv")
+	}
 
 	var loginURL string
 	switch service {
@@ -200,7 +203,7 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	fmt.Println("\n=== TOOLTIP INSPECTION RESULTS ===")
 	jsonBytes, _ := json.MarshalIndent(tooltipInfo, "", "  ")
 	fmt.Println(string(jsonBytes))
-	fmt.Println("==================================\n")
+	fmt.Println("==================================")
 
 	return nil
 }

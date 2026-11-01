@@ -1,0 +1,79 @@
+package scraper
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+
+	"github.com/chromedp/chromedp"
+)
+
+const nysegAPIHost = "engage-api-gw-dod79bsd.ue.gateway.dev"
+
+var promiseIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,256}$`)
+
+func validateNYSEGDownloadURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid CSV download URL (suppressed)")
+	}
+	host := strings.ToLower(u.Hostname())
+	// Existing portal exports use S3. Reject unexpected destinations rather than
+	// allowing a portal response to turn into an arbitrary internal HTTP request.
+	if !strings.HasSuffix(host, ".amazonaws.com") || !(strings.HasPrefix(host, "s3.") || strings.Contains(host, ".s3.") || strings.HasSuffix(host, ".s3.amazonaws.com")) {
+		return fmt.Errorf("CSV download host is not an approved HTTPS S3 endpoint")
+	}
+	return nil
+}
+
+func readNYSEGBody(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading NYSEG response: %w", safeNYSEGError(err))
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("NYSEG response exceeds size limit")
+	}
+	return b, nil
+}
+
+// NYSEGBrowserOptions keeps site isolation and the browser sandbox enabled by
+// default, including when chromedp would otherwise disable sandbox for root.
+// Only a non-root container may explicitly opt out of sandbox; see README.
+func NYSEGBrowserOptions(visible bool) []chromedp.ExecAllocatorOption {
+	opts := append([]chromedp.ExecAllocatorOption(nil), chromedp.DefaultExecAllocatorOptions[:]...)
+	return append(opts,
+		chromedp.Flag("headless", !visible),
+		chromedp.Flag("no-sandbox", os.Getenv("GRIDSCRAPER_NO_SANDBOX") == "1" && os.Geteuid() != 0),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		// chromedp defaults disable site-per-process and several protection features.
+		chromedp.Flag("disable-features", "Translate,BlinkGenPropertyTrees"),
+		chromedp.Flag("site-per-process", true),
+		chromedp.Flag("disable-ipc-flooding-protection", false),
+		chromedp.Flag("disable-client-side-phishing-detection", false),
+		chromedp.Flag("safebrowsing-disable-auto-update", false),
+		chromedp.WindowSize(1920, 1080),
+	)
+}
+
+func isNYSEGAPIURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Host == nysegAPIHost && u.User == nil
+}
+
+// Browser/HTTP errors can embed signed URLs or even script source. Do not
+// propagate their arbitrary text to logs. Preserve useful cancellation classes.
+func safeNYSEGError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return errors.New("operation failed (remote details suppressed to protect credentials)")
+}

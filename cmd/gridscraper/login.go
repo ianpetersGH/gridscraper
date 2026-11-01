@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/network"
@@ -50,10 +52,13 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 	)
 
+	if service == "nyseg" {
+		opts = scraper.NYSEGBrowserOptions(true)
+	}
 	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer cancel()
 
-	ctx, cancel := chromedp.NewContext(allocCtx)
+	ctx, cancel := chromedp.NewContext(allocCtx, chromedp.WithErrorf(func(string, ...interface{}) { fmt.Println("Browser protocol error (details suppressed)") }))
 	defer cancel()
 
 	// Set a longer timeout for user to login
@@ -63,9 +68,15 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	// Enable network monitoring to capture auth token
 	var capturedAuthToken string
 	var tokenCaptured bool
+	var tokenMu sync.Mutex
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		switch ev := ev.(type) {
 		case *network.EventRequestWillBeSent:
+			if service == "nyseg" && !strings.HasPrefix(ev.Request.URL, "https://engage-api-gw-dod79bsd.ue.gateway.dev/") {
+				return
+			}
+			tokenMu.Lock()
+			defer tokenMu.Unlock()
 			// Capture auth token from any request (only report once)
 			if !tokenCaptured {
 				// Check both possible header names
@@ -88,6 +99,9 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		network.Enable(),
 		chromedp.Navigate(loginURL),
 	); err != nil {
+		if service == "nyseg" {
+			return fmt.Errorf("NYSEG login navigation failed (remote details suppressed)")
+		}
 		return fmt.Errorf("navigating to login page: %w", err)
 	}
 
@@ -98,6 +112,9 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	fmt.Println("Extracting cookies...")
 	cookies, err := scraper.ExtractCookies(ctx)
 	if err != nil {
+		if service == "nyseg" {
+			return fmt.Errorf("NYSEG cookie extraction failed (remote details suppressed)")
+		}
 		return fmt.Errorf("extracting cookies: %w", err)
 	}
 
@@ -105,7 +122,10 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no cookies found - make sure you're logged in")
 	}
 
-	if capturedAuthToken == "" {
+	tokenMu.Lock()
+	token := capturedAuthToken
+	tokenMu.Unlock()
+	if token == "" {
 		fmt.Println("⚠ Warning: No auth token captured from network requests")
 		fmt.Println("  You may need to click a download/export button, or add username/password to config for auto-login")
 	}
@@ -120,8 +140,8 @@ func runLogin(cmd *cobra.Command, args []string) error {
 	switch service {
 	case "nyseg":
 		cfg.Cookies.NYSEG = cookies
-		if capturedAuthToken != "" {
-			cfg.Cookies.NYSEGAuthToken = capturedAuthToken
+		if token != "" {
+			cfg.Cookies.NYSEGAuthToken = token
 		}
 	case "coned":
 		cfg.Cookies.ConEd = cookies
@@ -132,11 +152,11 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
-	if service == "nyseg" && capturedAuthToken != "" {
+	if service == "nyseg" && token != "" {
 		fmt.Printf("✓ Successfully saved %d cookies and auth token for %s\n", len(cookies), service)
 	} else {
 		fmt.Printf("✓ Successfully saved %d cookies for %s\n", len(cookies), service)
-		if service == "nyseg" && capturedAuthToken == "" {
+		if service == "nyseg" && token == "" {
 			fmt.Println("  ⚠ No auth token captured - click a download button or add username/password to config")
 		}
 	}
