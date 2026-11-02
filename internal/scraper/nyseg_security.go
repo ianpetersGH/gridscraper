@@ -49,7 +49,7 @@ func readNYSEGBody(r io.Reader, limit int64) ([]byte, error) {
 func NYSEGBrowserOptions(visible bool) []chromedp.ExecAllocatorOption {
 	opts := append([]chromedp.ExecAllocatorOption(nil), chromedp.DefaultExecAllocatorOptions[:]...)
 	return append(opts,
-		chromedp.Flag("headless", !visible),
+		chromedp.Flag("headless", !visible && os.Getenv("GRIDSCRAPER_VIRTUAL_DISPLAY") != "1"),
 		chromedp.Flag("no-sandbox", os.Getenv("GRIDSCRAPER_NO_SANDBOX") == "1" && os.Geteuid() != 0),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		// chromedp defaults disable site-per-process and several protection features.
@@ -66,7 +66,7 @@ func NYSEGBrowserOptions(visible bool) []chromedp.ExecAllocatorOption {
 // here must not be reported as rejected credentials or retried as a login.
 func openNYSEGLogin(ctx context.Context) error {
 	if err := chromedp.Run(ctx,
-		chromedp.Navigate("https://sso.nyseg.com/es/login"),
+		chromedp.Navigate("https://sso.nyseg.com/"),
 		chromedp.Sleep(2*time.Second),
 		chromedp.WaitVisible(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, chromedp.ByQuery),
 	); err != nil {

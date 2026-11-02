@@ -147,8 +147,9 @@ func TestSafeNYSEGErrorPreservesOnlyNetworkCodes(t *testing.T) {
 func TestBrowserSecurityFlags(t *testing.T) {
 	// A fake executable records real chromedp process arguments without visiting
 	// a website, starting Chromium or receiving any real credentials.
-	for _, optOut := range []string{"", "1"} {
-		t.Run("optout="+optOut, func(t *testing.T) {
+	for _, scenario := range []struct{ optOut, virtualDisplay string }{{"", ""}, {"1", ""}, {"", "1"}, {"1", "1"}} {
+		optOut, virtualDisplay := scenario.optOut, scenario.virtualDisplay
+		t.Run("optout="+optOut+"/virtual="+virtualDisplay, func(t *testing.T) {
 			dir := t.TempDir()
 			exe := filepath.Join(dir, "fake-chrome")
 			argsPath := filepath.Join(dir, "args")
@@ -157,6 +158,7 @@ func TestBrowserSecurityFlags(t *testing.T) {
 			}
 			t.Setenv("ARGS_FILE", argsPath)
 			t.Setenv("GRIDSCRAPER_NO_SANDBOX", optOut)
+			t.Setenv("GRIDSCRAPER_VIRTUAL_DISPLAY", virtualDisplay)
 			opts := append(NYSEGBrowserOptions(false), chromedp.ExecPath(exe))
 			ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 			defer cancel()
@@ -170,6 +172,9 @@ func TestBrowserSecurityFlags(t *testing.T) {
 				t.Fatal(err)
 			}
 			args := string(b)
+			if strings.Contains(args, "--headless\n") != (virtualDisplay != "1") {
+				t.Fatalf("wrong browser mode for virtual display=%q", virtualDisplay)
+			}
 			if strings.Contains(args, "--no-sandbox\n") != (optOut == "1" && os.Geteuid() != 0) {
 				t.Fatalf("incorrect sandbox policy: %s", args)
 			}

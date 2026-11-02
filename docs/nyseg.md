@@ -92,6 +92,14 @@ This work does not open or migrate any user's actual database.
   before reading config: unredacted HTML/network dumps can contain credentials.
   `fetch nyseg --visible` uses an ephemeral profile, not a fixed shared profile or
   a fixed externally attachable debug port. Do not publish manual browser dumps.
+- **Virtual display:** set `GRIDSCRAPER_VIRTUAL_DISPLAY=1` only when a local X
+  display is supplied (for example, `xvfb-run -a gridscraper fetch nyseg`). This
+  runs ordinary Chromium rather than headless Chromium without exposing a GUI
+  port. A credential-free A/B test on the same host and container loaded the
+  canonical `https://sso.nyseg.com/` form in normal mode while headless mode
+  returned `net::ERR_HTTP2_PROTOCOL_ERROR`. The default remains headless unless
+  `--visible` or this explicit environment option is selected. This changes
+  browser mode, not TLS validation, site isolation, or sandbox policy.
 - Site isolation and the Chromium sandbox remain enabled by default. The policy
   also overrides chromedp defaults that disable site-per-process and protection
   features. Running as root is not supported as a sandbox bypass.
