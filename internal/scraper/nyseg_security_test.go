@@ -120,6 +120,30 @@ func TestNYSEGURLPolicyAndLimits(t *testing.T) {
 	}
 }
 
+func TestSafeNYSEGErrorPreservesOnlyNetworkCodes(t *testing.T) {
+	for _, code := range []string{
+		"net::ERR_HTTP2_PROTOCOL_ERROR", "net::ERR_CONNECTION_RESET",
+		"net::ERR_CONNECTION_CLOSED", "net::ERR_CONNECTION_TIMED_OUT",
+		"net::ERR_NAME_NOT_RESOLVED", "net::ERR_CERT_DATE_INVALID",
+		"net::ERR_CERT_AUTHORITY_INVALID", "net::ERR_SSL_PROTOCOL_ERROR",
+	} {
+		t.Run(code, func(t *testing.T) {
+			raw := errors.New("page https://example.invalid/?token=TEST_SECRET: " + code + " password=TEST_PASSWORD")
+			if got := safeNYSEGError(raw).Error(); got != code {
+				t.Fatalf("want static network code %q, got %q", code, got)
+			}
+		})
+	}
+	if got := safeNYSEGError(errors.New("arbitrary remote text TEST_SECRET")).Error(); strings.Contains(got, "TEST_SECRET") {
+		t.Fatal("arbitrary error leaked")
+	}
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded} {
+		if !errors.Is(safeNYSEGError(err), err) {
+			t.Fatal("lost cancellation classification")
+		}
+	}
+}
+
 func TestBrowserSecurityFlags(t *testing.T) {
 	// A fake executable records real chromedp process arguments without visiting
 	// a website, starting Chromium or receiving any real credentials.

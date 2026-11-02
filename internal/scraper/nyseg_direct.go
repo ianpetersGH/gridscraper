@@ -117,20 +117,20 @@ func (s *NYSEGDirectScraper) RefreshAuth(ctx context.Context) ([]config.Cookie, 
 		}
 	})
 
-	// Perform login
-	const loginURL = "https://sso.nyseg.com/es/login"
+	if err := chromedp.Run(browserCtx, network.Enable()); err != nil {
+		return nil, "", fmt.Errorf("enabling network: %w", safeNYSEGError(err))
+	}
+	if err := openNYSEGLogin(browserCtx); err != nil {
+		return nil, "", err
+	}
 	if err := chromedp.Run(browserCtx,
-		network.Enable(),
-		chromedp.Navigate(loginURL),
-		chromedp.Sleep(2*time.Second), // Wait for page to fully load
-		chromedp.WaitVisible(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, s.username, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_password`, s.password, chromedp.ByQuery),
 		chromedp.Sleep(500*time.Millisecond),
 		chromedp.Click(`button[type="submit"]`, chromedp.ByQuery),
 		chromedp.Sleep(5*time.Second), // Wait longer for redirect and auth
 	); err != nil {
-		return nil, "", fmt.Errorf("login failed: %w", safeNYSEGError(err))
+		return nil, "", fmt.Errorf("submitting NYSEG login form: %w", safeNYSEGError(err))
 	}
 
 	// Navigate to insights to trigger API calls that will include the auth token
@@ -221,19 +221,18 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		return nil, fmt.Errorf("enabling network: %w", safeNYSEGError(err))
 	}
 
-	// Perform login
-	const loginURL = "https://sso.nyseg.com/es/login"
-	fmt.Println("Logging in to NYSEG...")
+	fmt.Println("Opening NYSEG login page (no credentials submitted yet)...")
+	if err := openNYSEGLogin(browserCtx); err != nil {
+		return nil, err
+	}
+	fmt.Println("Submitting NYSEG login form...")
 	if err := chromedp.Run(browserCtx,
-		chromedp.Navigate(loginURL),
-		chromedp.Sleep(2*time.Second),
-		chromedp.WaitVisible(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, s.username, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_password`, s.password, chromedp.ByQuery),
 		chromedp.Sleep(500*time.Millisecond),
 		chromedp.Click(`button[type="submit"]`, chromedp.ByQuery),
 	); err != nil {
-		return nil, fmt.Errorf("login failed: %w", safeNYSEGError(err))
+		return nil, fmt.Errorf("submitting NYSEG login form: %w", safeNYSEGError(err))
 	}
 
 	// Wait a bit for login to process, then explicitly navigate to insights

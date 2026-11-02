@@ -9,6 +9,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/chromedp/chromedp"
 )
@@ -61,6 +62,19 @@ func NYSEGBrowserOptions(visible bool) []chromedp.ExecAllocatorOption {
 	)
 }
 
+// openNYSEGLogin is deliberately credential-free. A navigation/selector failure
+// here must not be reported as rejected credentials or retried as a login.
+func openNYSEGLogin(ctx context.Context) error {
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate("https://sso.nyseg.com/es/login"),
+		chromedp.Sleep(2*time.Second),
+		chromedp.WaitVisible(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, chromedp.ByQuery),
+	); err != nil {
+		return fmt.Errorf("opening NYSEG login page (no credentials submitted): %w", safeNYSEGError(err))
+	}
+	return nil
+}
+
 func isNYSEGAPIURL(raw string) bool {
 	u, err := url.Parse(raw)
 	return err == nil && u.Scheme == "https" && u.Host == nysegAPIHost && u.User == nil
@@ -74,6 +88,18 @@ func safeNYSEGError(err error) error {
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return context.DeadlineExceeded
+	}
+	// Emit only constant allowlisted codes, never arbitrary text, signed URLs,
+	// script source, request headers or a response containing user credentials.
+	for _, code := range []string{
+		"net::ERR_HTTP2_PROTOCOL_ERROR", "net::ERR_CONNECTION_RESET",
+		"net::ERR_CONNECTION_CLOSED", "net::ERR_CONNECTION_TIMED_OUT",
+		"net::ERR_NAME_NOT_RESOLVED", "net::ERR_CERT_DATE_INVALID",
+		"net::ERR_CERT_AUTHORITY_INVALID", "net::ERR_SSL_PROTOCOL_ERROR",
+	} {
+		if strings.Contains(err.Error(), code) {
+			return errors.New(code)
+		}
 	}
 	return errors.New("operation failed (remote details suppressed to protect credentials)")
 }
