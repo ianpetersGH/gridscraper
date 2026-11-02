@@ -133,14 +133,12 @@ func (s *NYSEGDirectScraper) RefreshAuth(ctx context.Context) ([]config.Cookie, 
 		return nil, "", fmt.Errorf("submitting NYSEG login form: %w", safeNYSEGError(err))
 	}
 
-	// Navigate to insights to trigger API calls that will include the auth token
-	if err := chromedp.Run(browserCtx,
-		chromedp.Navigate(nysegInsightsURL),
-		chromedp.Sleep(3*time.Second), // Wait for page to load
-		chromedp.WaitVisible(`div.engage-insights-explore`, chromedp.ByQuery),
-		chromedp.Sleep(3*time.Second), // Wait for API calls to complete
-	); err != nil {
-		return nil, "", fmt.Errorf("navigating to insights: %w", safeNYSEGError(err))
+	// Navigate to insights to trigger API calls that will include the auth token.
+	if err := openNYSEGInsights(browserCtx); err != nil {
+		return nil, "", err
+	}
+	if err := chromedp.Run(browserCtx, chromedp.Sleep(6*time.Second)); err != nil {
+		return nil, "", fmt.Errorf("waiting for insights API: %w", safeNYSEGError(err))
 	}
 
 	// Extract cookies
@@ -246,12 +244,11 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 
 	// Navigate to insights page (don't wait for auto-redirect, navigate explicitly)
 	fmt.Println("Navigating to insights page...")
-	if err := chromedp.Run(browserCtx,
-		chromedp.Navigate(nysegInsightsURL),
-		chromedp.WaitVisible(`div.engage-insights-explore`, chromedp.ByQuery),
-		chromedp.Sleep(2*time.Second),
-	); err != nil {
-		return nil, fmt.Errorf("navigating to insights page: %w", safeNYSEGError(err))
+	if err := openNYSEGInsights(browserCtx); err != nil {
+		return nil, err
+	}
+	if err := chromedp.Run(browserCtx, chromedp.Sleep(2*time.Second)); err != nil {
+		return nil, fmt.Errorf("waiting for insights API: %w", safeNYSEGError(err))
 	}
 
 	// Wait for page to load and API calls to complete (which captures auth tokens)

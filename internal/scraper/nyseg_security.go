@@ -75,6 +75,50 @@ func openNYSEGLogin(ctx context.Context) error {
 	return nil
 }
 
+// openNYSEGInsights bounds the legacy selector wait and emits only booleans.
+// Never dump authenticated page text, account identifiers, URLs or HTML.
+func openNYSEGInsights(ctx context.Context) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	err := chromedp.Run(waitCtx,
+		chromedp.Navigate(nysegInsightsURL),
+		chromedp.WaitVisible(`div.engage-insights-explore`, chromedp.ByQuery),
+	)
+	if err == nil {
+		return nil
+	}
+	var state struct {
+		SSO      bool `json:"sso"`
+		Energy   bool `json:"energy"`
+		Login    bool `json:"login"`
+		Password bool `json:"password"`
+		Verify   bool `json:"verify"`
+		Alert    bool `json:"alert"`
+		Download bool `json:"download"`
+	}
+	probeCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+	defer stop()
+	probeErr := chromedp.Run(probeCtx, chromedp.Evaluate(`(() => ({
+        sso: location.hostname === "sso.nyseg.com",
+        energy: location.hostname === "energymanager.nyseg.com",
+        login: !!document.querySelector("input#_com_liferay_login_web_portlet_LoginPortlet_login"),
+        password: !!document.querySelector("input[type=password]"),
+        verify: !!document.querySelector('input[autocomplete="one-time-code"]'),
+        alert: Array.from(document.querySelectorAll('.alert-danger,.alert-error,[role=alert]')).some(e => !!e.innerText.trim()),
+        download: !!document.body && document.body.innerText.includes("Download my energy usage data")
+    }))()`, &state))
+	if probeErr != nil {
+		return fmt.Errorf("waiting for NYSEG Energy Manager (page state unavailable): %w", safeNYSEGError(err))
+	}
+	// Permit a changed container layout only when the expected export UI exists
+	// at the exact trusted portal host. The next stage still verifies the modal.
+	if state.Energy && state.Download {
+		return nil
+	}
+	return fmt.Errorf("waiting for NYSEG Energy Manager (sso=%t energy=%t login_form=%t password_field=%t verification_field=%t alert=%t download_ui=%t): %w",
+		state.SSO, state.Energy, state.Login, state.Password, state.Verify, state.Alert, state.Download, safeNYSEGError(err))
+}
+
 func isNYSEGAPIURL(raw string) bool {
 	u, err := url.Parse(raw)
 	return err == nil && u.Scheme == "https" && u.Host == nysegAPIHost && u.User == nil
