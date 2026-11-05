@@ -39,6 +39,9 @@ func init() {
 
 func runDebug(cmd *cobra.Command, args []string) error {
 	service := args[0]
+	if service == "nyseg" {
+		return fmt.Errorf("raw NYSEG diagnostics are disabled: HTML/network dumps may expose credentials; use fetch --visible or offline import-csv")
+	}
 
 	var loginURL string
 	switch service {
@@ -243,7 +246,7 @@ func runDebug(cmd *cobra.Command, args []string) error {
 	fmt.Println("IMPORTANT: With the browser open, manually hover over a bar and:")
 	fmt.Println("1. Right-click -> Inspect on the tooltip popup")
 	fmt.Println("2. Note the HTML structure and selectors")
-	fmt.Println("3. Share the structure so we can update the scraper\n")
+	fmt.Println("3. Share the structure so we can update the scraper")
 
 	// Extract HTML
 	var html string

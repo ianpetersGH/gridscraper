@@ -4,6 +4,7 @@ data.db*
 
 # Binary (only in root directory)
 /gridscraper
+/.build/
 
 # Go build artifacts
 *.exe

@@ -2,12 +2,9 @@ package scraper
 
 import (
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -17,8 +14,6 @@ import (
 	"github.com/jgoulah/gridscraper/internal/config"
 	"github.com/jgoulah/gridscraper/pkg/models"
 )
-
-const nysegAPIURL = "https://engage-api-gw-dod79bsd.ue.gateway.dev/v2/usage"
 
 // AuthError represents an authentication failure
 type AuthError struct {
@@ -30,7 +25,7 @@ func (e *AuthError) Error() string {
 	return e.Message
 }
 
-// NYSEGDirectScraper scrapes data from NYSEG using direct API calls
+// NYSEGDirectScraper uses browser-authenticated CSV export (legacy type name).
 type NYSEGDirectScraper struct {
 	cookies   []config.Cookie
 	authToken string
@@ -44,12 +39,12 @@ func (s *NYSEGDirectScraper) SetVisible(visible bool) {
 	s.visible = visible
 }
 
-// NewNYSEGDirectScraper creates a new NYSEG direct API scraper
+// NewNYSEGDirectScraper creates a NYSEG browser CSV scraper
 func NewNYSEGDirectScraper(cookies []config.Cookie) *NYSEGDirectScraper {
 	return &NYSEGDirectScraper{cookies: cookies}
 }
 
-// NewNYSEGDirectScraperWithToken creates a new NYSEG direct API scraper with auth token
+// NewNYSEGDirectScraperWithToken creates a NYSEG browser CSV scraper with auth token
 func NewNYSEGDirectScraperWithToken(cookies []config.Cookie, authToken string) *NYSEGDirectScraper {
 	return &NYSEGDirectScraper{
 		cookies:   cookies,
@@ -57,7 +52,7 @@ func NewNYSEGDirectScraperWithToken(cookies []config.Cookie, authToken string) *
 	}
 }
 
-// NewNYSEGDirectScraperWithCredentials creates a new NYSEG direct API scraper with credentials for auto-login
+// NewNYSEGDirectScraperWithCredentials creates a NYSEG browser CSV scraper with credentials for auto-login
 func NewNYSEGDirectScraperWithCredentials(cookies []config.Cookie, authToken, username, password string) *NYSEGDirectScraper {
 	return &NYSEGDirectScraper{
 		cookies:   cookies,
@@ -75,22 +70,12 @@ func (s *NYSEGDirectScraper) RefreshAuth(ctx context.Context) ([]config.Cookie, 
 
 	fmt.Println("Refreshing authentication...")
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("no-sandbox", true),            // Required for running as root on Linux
-		chromedp.Flag("disable-gpu", true),           // Recommended for headless Linux
-		chromedp.Flag("disable-dev-shm-usage", true), // Avoid /dev/shm issues on Linux
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("disable-features", "IsolateOrigins,site-per-process"),
-		chromedp.Flag("disable-http2", true),
-		chromedp.Flag("disable-quic", true),
-		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-	)
+	opts := NYSEGBrowserOptions(s.visible)
 
 	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
 	defer cancel()
 
-	browserCtx, cancel := chromedp.NewContext(allocCtx)
+	browserCtx, cancel := chromedp.NewContext(allocCtx, chromedp.WithErrorf(func(string, ...interface{}) { fmt.Println("NYSEG browser protocol error (details suppressed)") }))
 	defer cancel()
 
 	browserCtx, cancel = context.WithTimeout(browserCtx, 60*time.Second)
@@ -99,19 +84,16 @@ func (s *NYSEGDirectScraper) RefreshAuth(ctx context.Context) ([]config.Cookie, 
 	// Set up network monitoring to capture auth token from API requests
 	var capturedAuthToken string
 	var tokenCaptured bool
+	var authMu sync.Mutex
 	chromedp.ListenTarget(browserCtx, func(ev interface{}) {
 		switch ev := ev.(type) {
 		case *network.EventRequestWillBeSent:
-			// Debug: show API requests to engage-api
-			if strings.Contains(ev.Request.URL, "engage-api") {
-				fmt.Printf("  [DEBUG] API request: %s\n", ev.Request.URL)
-				for k, v := range ev.Request.Headers {
-					if strings.Contains(strings.ToLower(k), "auth") {
-						fmt.Printf("  [DEBUG]   Header %s: %v\n", k, v)
-					}
-				}
+			if !isNYSEGAPIURL(ev.Request.URL) {
+				return
 			}
-			// Capture auth token from any request (check both header names)
+			authMu.Lock()
+			defer authMu.Unlock()
+			// Capture auth token only from the expected API host.
 			if !tokenCaptured {
 				// Try Up-Authorization first
 				if authToken, ok := ev.Request.Headers["Up-Authorization"]; ok {
@@ -135,51 +117,38 @@ func (s *NYSEGDirectScraper) RefreshAuth(ctx context.Context) ([]config.Cookie, 
 		}
 	})
 
-	// Perform login
-	const loginURL = "https://sso.nyseg.com/es/login"
-	fmt.Printf("  [DEBUG] Navigating to login: %s\n", loginURL)
+	if err := chromedp.Run(browserCtx, network.Enable()); err != nil {
+		return nil, "", fmt.Errorf("enabling network: %w", safeNYSEGError(err))
+	}
+	if err := openNYSEGLogin(browserCtx); err != nil {
+		return nil, "", err
+	}
 	if err := chromedp.Run(browserCtx,
-		network.Enable(),
-		chromedp.Navigate(loginURL),
-		chromedp.Sleep(2*time.Second), // Wait for page to fully load
-		chromedp.WaitVisible(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, s.username, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_password`, s.password, chromedp.ByQuery),
 		chromedp.Sleep(500*time.Millisecond),
 		chromedp.Click(`button[type="submit"]`, chromedp.ByQuery),
 		chromedp.Sleep(5*time.Second), // Wait longer for redirect and auth
 	); err != nil {
-		return nil, "", fmt.Errorf("login failed: %w", err)
+		return nil, "", fmt.Errorf("submitting NYSEG login form: %w", safeNYSEGError(err))
 	}
 
-	// Check current URL after login
-	var currentURL string
-	if err := chromedp.Run(browserCtx, chromedp.Location(&currentURL)); err == nil {
-		fmt.Printf("  [DEBUG] URL after login: %s\n", currentURL)
+	// Navigate to insights to trigger API calls that will include the auth token.
+	if err := openNYSEGInsights(browserCtx); err != nil {
+		return nil, "", err
 	}
-
-	// Navigate to insights to trigger API calls that will include the auth token
-	fmt.Printf("  [DEBUG] Navigating to insights: %s\n", nysegInsightsURL)
-	if err := chromedp.Run(browserCtx,
-		chromedp.Navigate(nysegInsightsURL),
-		chromedp.Sleep(3*time.Second), // Wait for page to load
-		chromedp.WaitVisible(`div.engage-insights-explore`, chromedp.ByQuery),
-		chromedp.Sleep(3*time.Second), // Wait for API calls to complete
-	); err != nil {
-		return nil, "", fmt.Errorf("navigating to insights: %w", err)
-	}
-
-	// Check final URL
-	if err := chromedp.Run(browserCtx, chromedp.Location(&currentURL)); err == nil {
-		fmt.Printf("  [DEBUG] Final URL: %s\n", currentURL)
+	if err := chromedp.Run(browserCtx, chromedp.Sleep(6*time.Second)); err != nil {
+		return nil, "", fmt.Errorf("waiting for insights API: %w", safeNYSEGError(err))
 	}
 
 	// Extract cookies
 	freshCookies, err := ExtractCookies(browserCtx)
 	if err != nil {
-		return nil, "", fmt.Errorf("extracting cookies: %w", err)
+		return nil, "", fmt.Errorf("extracting cookies: %w", safeNYSEGError(err))
 	}
 
+	authMu.Lock()
+	defer authMu.Unlock()
 	// Use the auth token captured from network requests
 	if capturedAuthToken == "" {
 		return nil, "", fmt.Errorf("could not capture auth token from network requests (did the page load correctly?)")
@@ -199,44 +168,12 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 
 	fmt.Println("Starting browser-based CSV download for hourly data...")
 
-	// Create temp directory for downloads
-	downloadDir, err := os.MkdirTemp("", "gridscraper-nyseg-*")
-	if err != nil {
-		return nil, fmt.Errorf("creating temp dir: %w", err)
-	}
-	fmt.Printf("Download directory: %s\n", downloadDir)
-	defer os.RemoveAll(downloadDir)
-
-	// Build browser options - use new headless mode which is less detectable
-	opts := []chromedp.ExecAllocatorOption{
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("disable-features", "IsolateOrigins,site-per-process"),
-		// Window size helps with proper rendering
-		chromedp.WindowSize(1920, 1080),
-		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-	}
-
-	// Use new headless mode (--headless=new) which renders like regular Chrome
-	// Old headless mode is easily detected and renders differently
-	if s.visible {
-		opts = append(opts,
-			chromedp.Flag("remote-debugging-port", "9222"),
-			chromedp.UserDataDir("/tmp/chrome-debug-profile"),
-		)
-	} else {
-		// New headless mode - much better compatibility with modern sites
-		opts = append(opts, chromedp.Flag("headless", "new"))
-	}
+	opts := NYSEGBrowserOptions(s.visible)
 
 	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
 	defer cancel()
 
-	browserCtx, cancel := chromedp.NewContext(allocCtx)
+	browserCtx, cancel := chromedp.NewContext(allocCtx, chromedp.WithErrorf(func(string, ...interface{}) { fmt.Println("NYSEG browser protocol error (details suppressed)") }))
 	defer cancel()
 
 	browserCtx, cancel = context.WithTimeout(browserCtx, 3*time.Minute)
@@ -252,7 +189,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		switch ev := ev.(type) {
 		case *network.EventRequestWillBeSent:
 			// Capture auth tokens from API requests
-			if strings.Contains(ev.Request.URL, "engage-api") {
+			if isNYSEGAPIURL(ev.Request.URL) {
 				tokenMu.Lock()
 				if capturedUpAuth == "" {
 					if authToken, ok := ev.Request.Headers["Up-Authorization"]; ok {
@@ -279,22 +216,21 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 	if err := chromedp.Run(browserCtx,
 		network.Enable(),
 	); err != nil {
-		return nil, fmt.Errorf("enabling network: %w", err)
+		return nil, fmt.Errorf("enabling network: %w", safeNYSEGError(err))
 	}
 
-	// Perform login
-	const loginURL = "https://sso.nyseg.com/es/login"
-	fmt.Println("Logging in to NYSEG...")
+	fmt.Println("Opening NYSEG login page (no credentials submitted yet)...")
+	if err := openNYSEGLogin(browserCtx); err != nil {
+		return nil, err
+	}
+	fmt.Println("Submitting NYSEG login form...")
 	if err := chromedp.Run(browserCtx,
-		chromedp.Navigate(loginURL),
-		chromedp.Sleep(2*time.Second),
-		chromedp.WaitVisible(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_login`, s.username, chromedp.ByQuery),
 		chromedp.SendKeys(`input#_com_liferay_login_web_portlet_LoginPortlet_password`, s.password, chromedp.ByQuery),
 		chromedp.Sleep(500*time.Millisecond),
 		chromedp.Click(`button[type="submit"]`, chromedp.ByQuery),
 	); err != nil {
-		return nil, fmt.Errorf("login failed: %w", err)
+		return nil, fmt.Errorf("submitting NYSEG login form: %w", safeNYSEGError(err))
 	}
 
 	// Wait a bit for login to process, then explicitly navigate to insights
@@ -303,38 +239,22 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 	if err := chromedp.Run(browserCtx,
 		chromedp.Sleep(5*time.Second),
 	); err != nil {
-		return nil, fmt.Errorf("waiting after login: %w", err)
-	}
-
-	// Debug: show where we are
-	var currentURL string
-	if err := chromedp.Run(browserCtx, chromedp.Location(&currentURL)); err == nil {
-		fmt.Printf("After login form submit, URL: %s\n", currentURL)
+		return nil, fmt.Errorf("waiting after login: %w", safeNYSEGError(err))
 	}
 
 	// Navigate to insights page (don't wait for auto-redirect, navigate explicitly)
 	fmt.Println("Navigating to insights page...")
-	if err := chromedp.Run(browserCtx,
-		chromedp.Navigate(nysegInsightsURL),
-		chromedp.WaitVisible(`div.engage-insights-explore`, chromedp.ByQuery),
-		chromedp.Sleep(2*time.Second),
-	); err != nil {
-		return nil, fmt.Errorf("navigating to insights page: %w", err)
+	if err := openNYSEGInsights(browserCtx); err != nil {
+		return nil, err
+	}
+	if err := chromedp.Run(browserCtx, chromedp.Sleep(2*time.Second)); err != nil {
+		return nil, fmt.Errorf("waiting for insights API: %w", safeNYSEGError(err))
 	}
 
 	// Wait for page to load and API calls to complete (which captures auth tokens)
 	fmt.Println("Waiting for page to fully load and capture auth tokens...")
 	if err := chromedp.Run(browserCtx, chromedp.Sleep(5*time.Second)); err != nil {
-		return nil, fmt.Errorf("waiting for page: %w", err)
-	}
-
-	// In visible mode, pause longer so DevTools can attach and user can interact
-	if s.visible {
-		fmt.Println("=== VISIBLE MODE: Pausing for 60 seconds for DevTools attachment ===")
-		fmt.Println("=== Connect to chrome://inspect or use remote-debugging-port 9222 ===")
-		if err := chromedp.Run(browserCtx, chromedp.Sleep(60*time.Second)); err != nil {
-			return nil, fmt.Errorf("debug pause: %w", err)
-		}
+		return nil, fmt.Errorf("waiting for page: %w", safeNYSEGError(err))
 	}
 
 	// Check if we captured the auth tokens
@@ -346,9 +266,9 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		return nil, fmt.Errorf("could not capture Up-Authorization token from API requests")
 	}
 
-	// Calculate date range (last N days)
-	endDate := time.Now()
-	startDate := endDate.AddDate(0, 0, -daysToFetch)
+	// The existing UI flow exports the portal-selected range. Do not pretend
+	// computing local dates changes the portal's export request.
+	fmt.Printf("NYSEG CSV uses portal-selected range; configured lookback (%d days) is not applied by this exporter.\n", daysToFetch)
 
 	// Set up listener to capture the download API response (promise_id)
 	var capturedPromiseID string
@@ -361,15 +281,14 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		switch ev := ev.(type) {
 		case *network.EventRequestWillBeSent:
 			// Log headers for download requests
-			if strings.Contains(ev.Request.URL, "usage/usage/download") {
-				fmt.Printf("  [NETWORK] Download API request: %s %s\n", ev.Request.Method, ev.Request.URL)
+			if isNYSEGAPIURL(ev.Request.URL) && strings.Contains(ev.Request.URL, "/usage/usage/download") {
 				downloadMu.Lock()
 				downloadRequestID = ev.RequestID
 				downloadMu.Unlock()
 			}
 		case *network.EventResponseReceived:
 			// Look for the download API response
-			if strings.Contains(ev.Response.URL, "usage/usage/download") {
+			if isNYSEGAPIURL(ev.Response.URL) && strings.Contains(ev.Response.URL, "/usage/usage/download") {
 				fmt.Printf("  [NETWORK] Download API response: status=%d\n", ev.Response.Status)
 			}
 		case *network.EventLoadingFinished:
@@ -386,7 +305,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 						body, err = network.GetResponseBody(reqID).Do(ctx)
 						return err
 					})); err != nil {
-						fmt.Printf("  [NETWORK] Could not get response body: %v\n", err)
+						fmt.Println("  [NETWORK] Could not read export response")
 						return
 					}
 					// Parse the promise_id from the response
@@ -397,14 +316,11 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 						downloadMu.Lock()
 						capturedPromiseID = resp.PromiseID
 						downloadMu.Unlock()
-						fmt.Printf("  [NETWORK] Captured promise_id: %s\n", resp.PromiseID)
 						// Signal that we got the promise_id
 						select {
 						case promiseIDChan <- resp.PromiseID:
 						default:
 						}
-					} else {
-						fmt.Printf("  [NETWORK] Response body: %s\n", string(body))
 					}
 				}()
 			}
@@ -421,7 +337,6 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 				const elements = document.querySelectorAll('*');
 				for (const el of elements) {
 					if (el.textContent && el.textContent.trim() === 'Download my energy usage data') {
-						console.log('Found download element:', el.tagName, el.className);
 						el.click();
 						return 'CLICKED: ' + el.tagName + '.' + el.className;
 					}
@@ -431,9 +346,8 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		`, &modalResult),
 		chromedp.Sleep(3*time.Second), // Wait for modal to open
 	); err != nil {
-		return nil, fmt.Errorf("opening download modal: %w", err)
+		return nil, fmt.Errorf("opening download modal: %w", safeNYSEGError(err))
 	}
-	fmt.Printf("Modal open result: %s\n", modalResult)
 	if modalResult == "NOT_FOUND" {
 		return nil, fmt.Errorf("could not find 'Download my energy usage data' button")
 	}
@@ -444,7 +358,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		if err := chromedp.Run(browserCtx,
 			chromedp.Evaluate(`document.body.innerText.includes('Select File Format')`, &modalVisible),
 		); err != nil {
-			return nil, fmt.Errorf("checking for modal: %w", err)
+			return nil, fmt.Errorf("checking for modal: %w", safeNYSEGError(err))
 		}
 		if modalVisible {
 			fmt.Println("Modal is visible")
@@ -452,7 +366,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		}
 		fmt.Printf("Waiting for modal to appear (attempt %d/5)...\n", i+1)
 		if err := chromedp.Run(browserCtx, chromedp.Sleep(1*time.Second)); err != nil {
-			return nil, fmt.Errorf("waiting for modal: %w", err)
+			return nil, fmt.Errorf("waiting for modal: %w", safeNYSEGError(err))
 		}
 	}
 	if !modalVisible {
@@ -525,9 +439,8 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		`, &csvResult),
 		chromedp.Sleep(1*time.Second),
 	); err != nil {
-		return nil, fmt.Errorf("selecting CSV format: %w", err)
+		return nil, fmt.Errorf("selecting CSV format: %w", safeNYSEGError(err))
 	}
-	fmt.Printf("CSV selection result: %s\n", csvResult)
 
 	// Click the Download file button
 	fmt.Println("Clicking Download file button...")
@@ -550,10 +463,8 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 						const json = await clonedResponse.json();
 						if (json.promise_id) {
 							window.__downloadPromiseID = json.promise_id;
-							console.log('Captured promise_id:', json.promise_id);
 						}
 					} catch (e) {
-						console.log('Could not parse download response:', e);
 					}
 				}
 				return response;
@@ -561,7 +472,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 			true
 		`, nil),
 	); err != nil {
-		return nil, fmt.Errorf("setting up fetch interceptor: %w", err)
+		return nil, fmt.Errorf("setting up fetch interceptor: %w", safeNYSEGError(err))
 	}
 
 	// Now click the download button using native chromedp click (sends real mouse events)
@@ -589,7 +500,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 			})()
 		`, &buttonSelector),
 	); err != nil {
-		return nil, fmt.Errorf("finding download button: %w", err)
+		return nil, fmt.Errorf("finding download button: %w", safeNYSEGError(err))
 	}
 
 	// Use chromedp's native click with the selector, or fall back to JavaScript
@@ -598,7 +509,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 			chromedp.Click(buttonSelector, chromedp.ByQuery),
 			chromedp.Sleep(2*time.Second),
 		); err != nil {
-			fmt.Printf("Native click failed: %v, trying JavaScript click\n", err)
+			fmt.Println("Native click failed; trying JavaScript click")
 			// Fall back to JavaScript click
 			if err := chromedp.Run(browserCtx,
 				chromedp.Evaluate(`
@@ -618,7 +529,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 				`, nil),
 				chromedp.Sleep(2*time.Second),
 			); err != nil {
-				return nil, fmt.Errorf("clicking download button: %w", err)
+				return nil, fmt.Errorf("clicking download button: %w", safeNYSEGError(err))
 			}
 		}
 		fmt.Println("Download button clicked via native chromedp")
@@ -643,9 +554,8 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 			`, &downloadBtnResult),
 			chromedp.Sleep(2*time.Second),
 		); err != nil {
-			return nil, fmt.Errorf("clicking download button: %w", err)
+			return nil, fmt.Errorf("clicking download button: %w", safeNYSEGError(err))
 		}
-		fmt.Printf("Download button result: %s\n", downloadBtnResult)
 		if downloadBtnResult == "NOT_FOUND" {
 			return nil, fmt.Errorf("could not find 'Download file' button in modal")
 		}
@@ -658,7 +568,8 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 	// Wait up to 15 seconds for the promise_id via channel
 	select {
 	case promiseID = <-promiseIDChan:
-		fmt.Printf("Got promise_id from network listener: %s\n", promiseID)
+	case <-browserCtx.Done():
+		return nil, browserCtx.Err()
 	case <-time.After(15 * time.Second):
 		fmt.Println("Timeout waiting for promise_id from network listener, trying fallbacks...")
 	}
@@ -668,9 +579,6 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 		downloadMu.Lock()
 		promiseID = capturedPromiseID
 		downloadMu.Unlock()
-		if promiseID != "" {
-			fmt.Printf("Got promise_id from captured variable: %s\n", promiseID)
-		}
 	}
 
 	// Fallback 2: Try fetch interceptor
@@ -680,19 +588,15 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 			chromedp.Evaluate(`window.__downloadPromiseID`, &fetchPromiseID),
 		); err == nil && fetchPromiseID != "" && fetchPromiseID != "null" {
 			promiseID = fetchPromiseID
-			fmt.Printf("Got promise_id from fetch interceptor: %s\n", promiseID)
 		}
 	}
 
 	if promiseID == "" || promiseID == "null" {
 		// Print diagnostic info
 		fmt.Println("ERROR: Could not capture promise_id. Diagnostic info:")
-		fmt.Printf("  - CSV selection result was: %s\n", csvResult)
 		fmt.Println("  - Check if download API request appeared in [NETWORK] logs above")
 		return nil, fmt.Errorf("could not capture promise_id from download request (check if CSV was selected)")
 	}
-
-	fmt.Printf("Got promise_id: %s, polling for CSV...\n", promiseID)
 
 	// Create HTTP client for polling
 	client := &http.Client{Timeout: 60 * time.Second}
@@ -708,7 +612,7 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 	headers.Set("Up-Authorization", upAuth)
 
 	// Poll for CSV
-	data, err := s.pollForCSV(ctx, promiseID, client, headers, startDate, endDate)
+	data, err := s.pollForCSV(browserCtx, promiseID, client, headers)
 	if err != nil {
 		return nil, fmt.Errorf("polling for CSV: %w", err)
 	}
@@ -724,478 +628,86 @@ func (s *NYSEGDirectScraper) Scrape(ctx context.Context, daysToFetch int) ([]mod
 	return data, nil
 }
 
-// parseV2UsageJSON parses the JSON response from the v2/usage endpoint
-func parseV2UsageJSON(bodyBytes []byte) ([]models.UsageData, error) {
-	// Debug: show first 500 chars of response
-	preview := string(bodyBytes)
-	if len(preview) > 500 {
-		preview = preview[:500]
+// pollForCSV polls the export job, not the v2 billing-summary API. Partial
+// results are never imported. Polling does not resubmit login credentials.
+func (s *NYSEGDirectScraper) pollForCSV(ctx context.Context, promiseID string, client *http.Client, headers http.Header) ([]models.UsageData, error) {
+	if !promiseIDPattern.MatchString(promiseID) {
+		return nil, fmt.Errorf("invalid export job identifier")
 	}
-	fmt.Printf("Response preview: %s\n", preview)
-
-	// The v2/usage endpoint returns data with fields: start_time, end_time, total_amount
-	type usageEntry struct {
-		StartTime   string  `json:"start_time"`
-		EndTime     string  `json:"end_time"`
-		TotalAmount float64 `json:"total_amount"`
-		PeakAmount  float64 `json:"peak_amount"`
-		OffPeak     float64 `json:"off_peak_amount"`
-	}
-
-	var usageEntries []usageEntry
-
-	if err := json.Unmarshal(bodyBytes, &usageEntries); err != nil {
-		// Try parsing as an object with a data field
-		var wrapper struct {
-			Commodity string       `json:"commodity"`
-			Data      []usageEntry `json:"data"`
-		}
-		if err2 := json.Unmarshal(bodyBytes, &wrapper); err2 != nil {
-			return nil, fmt.Errorf("parsing JSON response: %w (body: %s)", err, string(bodyBytes)[:min(200, len(bodyBytes))])
-		}
-		usageEntries = wrapper.Data
-	}
-
-	fmt.Printf("Found %d entries in JSON response\n", len(usageEntries))
-
-	var result []models.UsageData
-	for _, entry := range usageEntries {
-		// Parse start time
-		var startTime time.Time
-		var err error
-		if entry.StartTime == "" {
-			continue
-		}
-
-		// Try multiple date formats
-		for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
-			startTime, err = time.Parse(layout, entry.StartTime)
-			if err == nil {
-				break
-			}
-		}
-		if err != nil {
-			fmt.Printf("Warning: could not parse start_time %q, skipping\n", entry.StartTime)
-			continue
-		}
-
-		// Use total_amount for usage
-		usage := entry.TotalAmount
-
-		// Parse end time if available
-		var endTime time.Time
-		if entry.EndTime != "" {
-			for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
-				endTime, err = time.Parse(layout, entry.EndTime)
-				if err == nil {
-					break
-				}
-			}
-		}
-		if endTime.IsZero() {
-			endTime = startTime.Add(24 * time.Hour) // Default to 1 day interval for daily data
-		}
-
-		result = append(result, models.UsageData{
-			Date:      startTime.Truncate(24 * time.Hour),
-			StartTime: startTime,
-			EndTime:   endTime,
-			KWh:       usage,
-			Service:   "nyseg",
-		})
-	}
-
-	fmt.Printf("✓ Parsed %d usage entries\n", len(result))
-	return result, nil
-}
-
-// pollForCSV polls the API with the promise_id until the CSV is ready
-func (s *NYSEGDirectScraper) pollForCSV(ctx context.Context, promiseID string, client *http.Client, headers http.Header, startDate, endDate time.Time) ([]models.UsageData, error) {
-	// The actual polling endpoint is /promix/{promise_id}, not /usage/usage/download
-	pollURL := fmt.Sprintf("https://engage-api-gw-dod79bsd.ue.gateway.dev/promix/%s", promiseID)
-
-	maxAttempts := 30
-	pollInterval := 2 * time.Second
-
-	fmt.Printf("Polling with URL: %s\n", pollURL)
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	pollURL := "https://" + nysegAPIHost + "/promix/" + promiseID
+	// Custom authentication headers must never be forwarded through redirects.
+	safeClient := *client
+	safeClient.Jar = nil
+	safeClient.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+	for attempt := 0; attempt < 30; attempt++ {
 		if attempt > 0 {
-			time.Sleep(pollInterval)
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 		}
-
-		fmt.Printf("Polling attempt %d/%d...\n", attempt+1, maxAttempts)
-
-		req, err := http.NewRequestWithContext(ctx, "GET", pollURL, nil)
+		fmt.Printf("Polling CSV export attempt %d/30...\n", attempt+1)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("creating poll request: %w", err)
+			return nil, fmt.Errorf("creating export request: %w", safeNYSEGError(err))
 		}
-
-		// Copy headers from original request
 		req.Header = headers.Clone()
-
-		resp, err := client.Do(req)
+		resp, err := safeClient.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("polling request: %w", err)
+			return nil, fmt.Errorf("export request: %w", safeNYSEGError(err))
 		}
-
-		bodyBytes, err := io.ReadAll(resp.Body)
+		body, readErr := readNYSEGBody(resp.Body, 64<<20)
 		resp.Body.Close()
-
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return nil, &AuthError{StatusCode: resp.StatusCode, Message: "NYSEG export authentication failed; login was not retried"}
+		}
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+			return nil, fmt.Errorf("export endpoint returned HTTP %d", resp.StatusCode)
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		if resp.StatusCode == http.StatusOK && (strings.Contains(contentType, "csv") || strings.Contains(contentType, "text/plain")) {
+			return parseNYSEGCSVReader(strings.NewReader(string(body)))
+		}
+		var result struct {
+			Code string `json:"code"`
+			URL  string `json:"promise_url"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, fmt.Errorf("invalid export status response (body suppressed)")
+		}
+		if strings.Contains(result.Code, "ERROR") || strings.Contains(result.Code, "FAILED") {
+			return nil, fmt.Errorf("NYSEG CSV generation failed (remote details suppressed)")
+		}
+		if result.Code != "PROMISE_FOUND" {
+			continue
+		} // Includes partial results: keep waiting.
+		if err := validateNYSEGDownloadURL(result.URL); err != nil {
+			return nil, err
+		}
+		csvReq, err := http.NewRequestWithContext(ctx, http.MethodGet, result.URL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("reading poll response: %w", err)
+			return nil, fmt.Errorf("creating CSV request: %w", safeNYSEGError(err))
 		}
-
-		// Debug: show response on first and every 5th attempt
-		if attempt == 0 || attempt == 5 {
-			preview := string(bodyBytes)
-			if len(preview) > 200 {
-				preview = preview[:200]
-			}
-			fmt.Printf("   Response (HTTP %d): %s\n", resp.StatusCode, preview)
-		}
-
-		// Check if we got CSV
-		contentType := resp.Header.Get("Content-Type")
-		if strings.Contains(contentType, "csv") || strings.Contains(contentType, "text") {
-			fmt.Println("✓ CSV ready, parsing...")
-			return parseNYSEGCSVReader(strings.NewReader(string(bodyBytes)))
-		}
-
-		// Check response for promise status
-		var promiseResp struct {
-			Code       string `json:"code"`
-			PromiseURL string `json:"promise_url"`
-		}
-		if err := json.Unmarshal(bodyBytes, &promiseResp); err == nil {
-			if attempt == 0 || attempt == 5 {
-				fmt.Printf("   Code: %s\n", promiseResp.Code)
-			}
-
-			// Check if data is ready - try fetching even if partial after a few attempts
-			if promiseResp.PromiseURL != "" && (promiseResp.Code == "PROMISE_FOUND" || (attempt > 5 && promiseResp.Code == "PROMISE_FOUND_PARTIAL_DATA")) {
-				fmt.Printf("✓ Data available (code: %s), fetching CSV from S3: %s\n", promiseResp.Code, promiseResp.PromiseURL)
-				// Fetch the CSV from S3
-				csvReq, err := http.NewRequestWithContext(ctx, "GET", promiseResp.PromiseURL, nil)
-				if err != nil {
-					return nil, fmt.Errorf("creating S3 request: %w", err)
-				}
-
-				csvResp, err := client.Do(csvReq)
-				if err != nil {
-					return nil, fmt.Errorf("fetching CSV from S3: %w", err)
-				}
-				defer csvResp.Body.Close()
-
-				if csvResp.StatusCode != http.StatusOK {
-					body, _ := io.ReadAll(csvResp.Body)
-					return nil, fmt.Errorf("S3 returned status %d: %s", csvResp.StatusCode, string(body))
-				}
-
-				return parseNYSEGCSVReader(csvResp.Body)
-			}
-
-			// Check for failure
-			if strings.Contains(promiseResp.Code, "ERROR") || strings.Contains(promiseResp.Code, "FAILED") {
-				return nil, fmt.Errorf("CSV generation failed with code: %s", promiseResp.Code)
-			}
-
-			// Otherwise still waiting (PROMISE_FOUND_PARTIAL_DATA or similar)
-		}
-	}
-
-	return nil, fmt.Errorf("CSV generation timed out after %d attempts", maxAttempts)
-}
-
-// pollForCSVViaBrowser polls the API using browser fetch() until CSV is ready
-func (s *NYSEGDirectScraper) pollForCSVViaBrowser(browserCtx context.Context, promiseID string, startDate, endDate time.Time) ([]models.UsageData, error) {
-	pollURL := fmt.Sprintf("https://engage-api-gw-dod79bsd.ue.gateway.dev/promix/%s", promiseID)
-
-	maxAttempts := 30
-	pollInterval := 2 * time.Second
-
-	fmt.Printf("Polling with URL: %s\n", pollURL)
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(pollInterval)
-		}
-
-		fmt.Printf("Polling attempt %d/%d...\n", attempt+1, maxAttempts)
-
-		// Use browser fetch for polling
-		setupJS := fmt.Sprintf(`
-			window.__pollResult = null;
-			window.__pollDone = false;
-			fetch('%s', {
-				method: 'GET',
-				credentials: 'include'
-			}).then(async response => {
-				const text = await response.text();
-				window.__pollResult = {
-					status: response.status,
-					contentType: response.headers.get('content-type'),
-					body: text
-				};
-				window.__pollDone = true;
-			}).catch(e => {
-				window.__pollResult = {
-					error: e.toString()
-				};
-				window.__pollDone = true;
-			});
-			true
-		`, pollURL)
-
-		if err := chromedp.Run(browserCtx, chromedp.Evaluate(setupJS, nil)); err != nil {
-			return nil, fmt.Errorf("starting browser fetch: %w", err)
-		}
-
-		var fetchResult map[string]interface{}
-		if err := chromedp.Run(browserCtx,
-			chromedp.PollFunction(`() => window.__pollDone === true`, nil, chromedp.WithPollingInterval(500*time.Millisecond), chromedp.WithPollingTimeout(30*time.Second)),
-			chromedp.Evaluate(`window.__pollResult`, &fetchResult),
-		); err != nil {
-			return nil, fmt.Errorf("browser fetch failed: %w", err)
-		}
-
-		if fetchResult == nil {
-			return nil, fmt.Errorf("browser fetch returned nil result")
-		}
-
-		if errVal, ok := fetchResult["error"]; ok && errVal != nil {
-			return nil, fmt.Errorf("browser fetch error: %v", errVal)
-		}
-
-		statusFloat, _ := fetchResult["status"].(float64)
-		status := int(statusFloat)
-		contentType, _ := fetchResult["contentType"].(string)
-		body, _ := fetchResult["body"].(string)
-
-		// Debug: show response on first and every 5th attempt
-		if attempt == 0 || attempt == 5 {
-			preview := body
-			if len(preview) > 200 {
-				preview = preview[:200]
-			}
-			fmt.Printf("   Response (HTTP %d): %s\n", status, preview)
-		}
-
-		// Check if we got CSV
-		if strings.Contains(contentType, "csv") || strings.Contains(contentType, "text") {
-			fmt.Println("✓ CSV ready, parsing...")
-			return parseNYSEGCSVReader(strings.NewReader(body))
-		}
-
-		// Check response for promise status
-		var promiseResp struct {
-			Code       string `json:"code"`
-			PromiseURL string `json:"promise_url"`
-		}
-		if err := json.Unmarshal([]byte(body), &promiseResp); err == nil {
-			if attempt == 0 || attempt == 5 {
-				fmt.Printf("   Code: %s\n", promiseResp.Code)
-			}
-
-			// Check if data is ready
-			if promiseResp.PromiseURL != "" && (promiseResp.Code == "PROMISE_FOUND" || (attempt > 5 && promiseResp.Code == "PROMISE_FOUND_PARTIAL_DATA")) {
-				fmt.Printf("✓ Data available (code: %s), fetching CSV from S3: %s\n", promiseResp.Code, promiseResp.PromiseURL)
-				// Fetch CSV from S3 URL (this doesn't require auth headers)
-				client := &http.Client{Timeout: 60 * time.Second}
-				csvResp, err := client.Get(promiseResp.PromiseURL)
-				if err != nil {
-					return nil, fmt.Errorf("fetching CSV from S3: %w", err)
-				}
-				defer csvResp.Body.Close()
-
-				if csvResp.StatusCode != http.StatusOK {
-					body, _ := io.ReadAll(csvResp.Body)
-					return nil, fmt.Errorf("S3 returned status %d: %s", csvResp.StatusCode, string(body))
-				}
-
-				return parseNYSEGCSVReader(csvResp.Body)
-			}
-
-			// Check for failure
-			if strings.Contains(promiseResp.Code, "ERROR") || strings.Contains(promiseResp.Code, "FAILED") {
-				return nil, fmt.Errorf("CSV generation failed with code: %s", promiseResp.Code)
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("CSV generation timed out after %d attempts", maxAttempts)
-}
-
-// extractAuthTokenFromBrowser uses chromedp to navigate to the page and extract the auth token
-func (s *NYSEGDirectScraper) extractAuthTokenFromBrowser(ctx context.Context) (string, error) {
-	fmt.Println("Extracting auth token from browser session...")
-
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("no-sandbox", true),            // Required for running as root on Linux
-		chromedp.Flag("disable-gpu", true),           // Recommended for headless Linux
-		chromedp.Flag("disable-dev-shm-usage", true), // Avoid /dev/shm issues on Linux
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("disable-features", "IsolateOrigins,site-per-process"),
-		chromedp.Flag("disable-http2", true),
-		chromedp.Flag("disable-quic", true),
-		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-	)
-
-	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
-	defer cancel()
-
-	browserCtx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	browserCtx, cancel = context.WithTimeout(browserCtx, 30*time.Second)
-	defer cancel()
-
-	// Set cookies
-	if err := SetCookies(browserCtx, s.cookies); err != nil {
-		return "", fmt.Errorf("setting cookies: %w", err)
-	}
-
-	// Navigate and extract token from localStorage or by intercepting requests
-	var token string
-	if err := chromedp.Run(browserCtx,
-		chromedp.Navigate(nysegInsightsURL),
-		chromedp.WaitVisible(`div.engage-insights-explore`, chromedp.ByQuery),
-		chromedp.Evaluate(`
-			(function() {
-				// Try localStorage
-				const lsToken = localStorage.getItem('up-authorization') ||
-				                localStorage.getItem('auth_token') ||
-				                localStorage.getItem('access_token');
-				if (lsToken) return lsToken;
-
-				// Try sessionStorage
-				const ssToken = sessionStorage.getItem('up-authorization') ||
-				                sessionStorage.getItem('auth_token') ||
-				                sessionStorage.getItem('access_token');
-				if (ssToken) return ssToken;
-
-				// Try to find it in any global variable
-				if (window.upAuthToken) return window.upAuthToken;
-				if (window.authToken) return window.authToken;
-
-				return null;
-			})()
-		`, &token),
-	); err != nil {
-		return "", fmt.Errorf("extracting token: %w", err)
-	}
-
-	if token == "" || token == "null" {
-		return "", fmt.Errorf("could not find X-Authentication token in browser storage")
-	}
-
-	fmt.Println("✓ Auth token extracted successfully")
-	return token, nil
-}
-
-// parseNYSEGCSVReader parses NYSEG CSV from a reader
-func parseNYSEGCSVReader(r io.Reader) ([]models.UsageData, error) {
-	reader := csv.NewReader(r)
-
-	// Read header to find column indices
-	header, err := reader.Read()
-	if err != nil {
-		return nil, fmt.Errorf("reading CSV header: %w", err)
-	}
-
-	// Find column indices
-	dateCol := -1
-	startTimeCol := -1
-	endTimeCol := -1
-	usageCol := -1
-
-	for i, col := range header {
-		colLower := strings.ToLower(strings.TrimSpace(col))
-		colLower = strings.TrimFunc(colLower, func(r rune) bool { return r < 0x20 || r == 0xFEFF })
-		switch {
-		case strings.Contains(colLower, "date") && !strings.Contains(colLower, "time"):
-			dateCol = i
-		case strings.Contains(colLower, "start time"):
-			startTimeCol = i
-		case strings.Contains(colLower, "end time"):
-			endTimeCol = i
-		case strings.Contains(colLower, "usage") || strings.Contains(colLower, "net unit") || colLower == "net":
-			usageCol = i
-		}
-	}
-
-	if dateCol == -1 || usageCol == -1 {
-		return nil, fmt.Errorf("could not find required columns (date and usage) in CSV. Header: %v", header)
-	}
-
-	// Parse data rows
-	var results []models.UsageData
-
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
+		// No NYSEG auth/cookie headers on signed object-storage URLs.
+		csvResp, err := safeClient.Do(csvReq)
 		if err != nil {
-			return nil, fmt.Errorf("reading CSV row: %w", err)
+			return nil, fmt.Errorf("downloading CSV: %w", safeNYSEGError(err))
 		}
-
-		if len(record) <= usageCol {
-			continue
+		csvBody, readErr := readNYSEGBody(csvResp.Body, 64<<20)
+		csvResp.Body.Close()
+		if csvResp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("CSV download returned HTTP %d", csvResp.StatusCode)
 		}
-
-		// Parse date
-		dateStr := strings.TrimSpace(record[dateCol])
-		if dateStr == "" {
-			continue
+		if readErr != nil {
+			return nil, readErr
 		}
-
-		date, err := parseNYSEGDate(dateStr)
-		if err != nil {
-			// Skip rows we can't parse
-			continue
-		}
-
-		// Parse usage (kWh)
-		usageStr := strings.TrimSpace(record[usageCol])
-		usage, err := parseKWh(usageStr)
-		if err != nil || usage == 0 {
-			continue
-		}
-
-		// Parse end time if available
-		var endTime time.Time
-		if endTimeCol != -1 && len(record) > endTimeCol {
-			endTimeStr := strings.TrimSpace(record[endTimeCol])
-			if endTimeStr != "" {
-				endTime, err = parseNYSEGDate(endTimeStr)
-				if err != nil {
-					endTime = time.Time{}
-				}
-			}
-		}
-
-		// Parse start time if available
-		var startTime time.Time
-		if startTimeCol != -1 && len(record) > startTimeCol {
-			startTimeStr := strings.TrimSpace(record[startTimeCol])
-			if startTimeStr != "" {
-				startTime, err = parseNYSEGDate(startTimeStr)
-				if err != nil {
-					startTime = time.Time{}
-				}
-			}
-		}
-
-		// Store each hourly record separately (no aggregation)
-		results = append(results, models.UsageData{
-			Date:      date,
-			StartTime: startTime,
-			EndTime:   endTime,
-			KWh:       usage,
-		})
+		return parseNYSEGCSVReader(strings.NewReader(string(csvBody)))
 	}
-
-	return results, nil
+	return nil, fmt.Errorf("CSV generation timed out without a complete export after 30 attempts")
 }

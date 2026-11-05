@@ -27,6 +27,9 @@ func init() {
 
 func runCapture(cmd *cobra.Command, args []string) error {
 	service := args[0]
+	if service == "nyseg" {
+		return fmt.Errorf("raw NYSEG diagnostics are disabled: HTML/network dumps may expose credentials; use fetch --visible or offline import-csv")
+	}
 
 	var loginURL string
 	switch service {
@@ -184,7 +187,7 @@ func runCapture(cmd *cobra.Command, args []string) error {
 	fmt.Println("1. Click the 'Download my energy usage data' link")
 	fmt.Println("2. Select 'bill period' and 'CSV' options")
 	fmt.Println("3. Click the download/export button")
-	fmt.Println("4. Press Enter here after the download completes\n")
+	fmt.Println("4. Press Enter here after the download completes")
 
 	fmt.Scanln()
 
@@ -200,7 +203,7 @@ func runCapture(cmd *cobra.Command, args []string) error {
 			fmt.Println(string(jsonBytes))
 		}
 	}
-	fmt.Println("=========================\n")
+	fmt.Println("=========================")
 
 	// Save auth token to config if captured
 	if capturedAuthToken != "" {
@@ -224,9 +227,9 @@ func runCapture(cmd *cobra.Command, args []string) error {
 
 func contains(s, substr string) bool {
 	return len(s) > 0 && len(substr) > 0 &&
-		   (s == substr || len(s) >= len(substr) &&
-		   (s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-		   indexOf(s, substr) >= 0))
+		(s == substr || len(s) >= len(substr) &&
+			(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
+				indexOf(s, substr) >= 0))
 }
 
 func indexOf(s, substr string) int {
